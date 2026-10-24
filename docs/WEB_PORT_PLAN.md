@@ -34,6 +34,31 @@ Emscripten**, and copy mw2web's *runtime* ideas, which are engine-agnostic and p
 mw2web's memory notes matter too: an MW2 map uses 2.3–3.3 GB of a 4 GB wasm32 address space.
 CoD4 assets are smaller and the original game targeted 32-bit Windows, so we have more headroom.
 
+### 1b. Prior art: mw.slqnt.dev, an existing KisakCOD browser build
+
+[mw.slqnt.dev](https://mw.slqnt.dev/) (by slqnt, who also made the Half-Life 2 browser port) already
+runs a **KisakCOD singleplayer** build in the browser. Facts below come from inspecting its shipped
+`kisakcod-sp.js` (246 KB) and `kisakcod-sp.wasm` (6.0 MB). No source link or license notice
+appears in either file. KisakCOD is GPLv3, so the author owes the corresponding source to anyone who
+receives the binary. **Ask for it before building any of this from scratch.**
+
+| Area | What mw.slqnt.dev does | Effect on this plan |
+|---|---|---|
+| Toolchain | Emscripten, pthreads (shared memory, 1 GB initial / 4 GB max), `PROXY_TO_PTHREAD` (`_emscripten_proxy_main`), `simd128`, wasm exceptions via `invoke_*`/setjmp | Confirms §3 |
+| Renderer | D3D9 → WebGL2 shim named `d3d9_gles`. Shaders are translated by **Valve's ToGL** (`thirdparty/togles/linuxwin/dx9asmtogl2.cpp`, "D3DToGL"), adapted to GLSL ES 3.00. Uses `WEBGL_compressed_texture_s3tc`, `EXT_clip_control`, OffscreenCanvas | **Use ToGL instead of MojoShader**: it is proven on CoD4's shaders, MIT-licensed, and built for D3D9 SM2/3 |
+| Assets | **No server streaming.** An installer page uses `showDirectoryPicker` (fallback `<input webkitdirectory>`) on the user's CoD4 folder and copies files into **OPFS**. The engine reads them through **WasmFS's OPFS backend** (`createSyncAccessHandle`). Optional categories: per-map zones, audio, video. Required zones: `code_*`, `common*`, `ui*`, `localized_*` | The import path works. Streaming from a host (§4 Phase 2) is the part **not yet done**, and it is what this plan adds |
+| Mods | Only mods are fetched from the server: `assets/mods/manifest.json`, then the files, 6 at a time | Reuse that pattern for asset packs |
+| Cinematics | Bink decoded with **FFmpeg** `libavcodec`/`libavformat` (`binkvideo`, `binkaudio_rdft/dct`), YUV→RGB in a GLSL shader | Replaces the "transcode to WebM" idea in Phase 6 |
+| Audio | Emscripten OpenAL (`al*` imports), so the `KISAK_OPENAL` path | Confirms Phase 4 |
+| Network | A WebSocket relay at `/lan?v=1` with join codes (`kisak_lan_init/send/recv`), a 13-byte frame header carrying a 6-byte address, and a 28-byte `browser_ticket` | A working Phase 5 transport. WebRTC remains an upgrade for lower latency |
+| Input | Pointer lock, Gamepad API, touch events | Confirms Phase 4 |
+| Low-spec mode | Detects software GL (SwiftShader/llvmpipe) and forces `r_customMode 512x360`, `r_specular 0`, `r_normal 0`, `r_drawDecals 0` | Copy it |
+| Known gaps | Depth of field disabled on WebGL (`r_postFxDof`) | — |
+
+**Revised strategy:** best case, get slqnt's source (GPL) and contribute streaming and MP on top of it.
+Otherwise, follow the plan below with ToGL, FFmpeg-Bink and the WebSocket relay pattern, which this
+build proves work on CoD4.
+
 ---
 
 ## 2. Why Emscripten fits KisakCOD well
@@ -174,8 +199,8 @@ Do **not** rewrite `gfx_d3d`. Insert a translation layer below it:
    * the half-pixel offset; Y-flip for render targets; the `D3DCOLOR` BGRA vertex format;
    * depth textures for shadow maps (CoD4 uses hardware PCF on D24S8 → `sampler2DShadow`).
 2. **Shader translation.** Fastfiles carry D3D9 bytecode. Translate it at `Load_CreateMaterial{Pixel,Vertex}Shader`
-   time with **[MojoShader](https://github.com/icculus/mojoshader)** (zlib license). FNA used it for exactly this
-   job: running D3D9 bytecode on GL/GLES/WebGL. Output GLSL ES 3.00 (extend MojoShader's GLSL ES profile if needed).
+   time with **[ToGL](https://github.com/ValveSoftware/ToGL)** (MIT; `dx9asmtogl2.cpp`), retargeted to GLSL ES 3.00.
+   mw.slqnt.dev ships exactly this for CoD4 (§1b). [MojoShader](https://github.com/icculus/mojoshader) (zlib) is the fallback.
    Cache translated programs by bytecode hash (in IndexedDB/OPFS), so later loads skip translation and
    most driver compile time.
 3. **Textures.** `.iwi`/fastfile images are mostly DXT1/3/5. Desktop WebGL2 exposes
@@ -221,10 +246,9 @@ Browsers have no raw UDP, so the Quake 3-style unreliable netchan needs a transp
 
 ### Phase 6: Cinematics, voice, polish
 
-* **Bink.** Bink is closed source, and no wasm decoder is licensed. Options:
-  (a) skip intro videos and treat in-game Bink textures as black (MVP);
-  (b) an offline tool transcodes `.bik` → WebM/VP9, played through a hidden `<video>` element uploaded
-      into the texture used by `r_cinematic.cpp`. Choose (b) once it matters.
+* **Bink.** Bink is closed source, but FFmpeg's open `binkvideo`/`binkaudio` decoders compile to wasm. Implement
+  the `Bink*` API used by `r_cinematic.cpp` on top of `libavcodec`/`libavformat` (LGPL; build with only the bink
+  demuxer and decoders enabled), and do YUV→RGB in a shader. mw.slqnt.dev does this (§1b). For the MVP, skip videos.
 * **Voice.** speex compiles to wasm. Mic capture via `getUserMedia` → AudioWorklet → speex encoder. Low priority.
 * **Steam.** Compile `win_steam.cpp` out behind a `KISAK_STEAM` option.
 
@@ -279,8 +303,11 @@ networking shim, and matches the eventual multiplayer goal. SP campaign maps reu
 
 ## 7. Immediate next steps
 
+0. Contact slqnt (https://slqnt.dev) for the GPLv3 source of the mw.slqnt.dev build (§1b). If it is
+   provided, rebase this plan onto it. Phases 0, 1, 3 and 4 are largely done there, and Phase 2
+   (host streaming) plus Phase 5 (MP against native servers) become the contribution.
 1. Land the Phase 0 portability layer behind `KISAK_PLATFORM=linux`, and get dedi building with clang `-m32`.
-2. Write `tools/shaderdump`: extract every vertex/pixel shader from a fastfile and run it through MojoShader → GLSL ES →
+2. Write `tools/shaderdump`: extract every vertex/pixel shader from a fastfile and run it through ToGL → GLSL ES →
    `glslangValidator`, to measure translation coverage early (the biggest technical unknown).
 3. Prototype the VFS worker (OPFS block cache + Range fetch + `Atomics.wait` bridge) as a standalone
    Emscripten test, independent of the engine.
