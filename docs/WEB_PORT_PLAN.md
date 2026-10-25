@@ -55,9 +55,57 @@ receives the binary. **Ask for it before building any of this from scratch.**
 | Low-spec mode | Detects software GL (SwiftShader/llvmpipe) and forces `r_customMode 512x360`, `r_specular 0`, `r_normal 0`, `r_drawDecals 0` | Copy it |
 | Known gaps | Depth of field disabled on WebGL (`r_postFxDof`) | — |
 
-**Revised strategy:** best case, get slqnt's source (GPL) and contribute streaming and MP on top of it.
-Otherwise, follow the plan below with ToGL, FFmpeg-Bink and the WebSocket relay pattern, which this
-build proves work on CoD4.
+slqnt's public repo, [slqntdevss/kisakcod-port](https://github.com/slqntdevss/kisakcod-port), contains
+**only built files**: `index.html`, `kisakcod-sp.{js,wasm}` (byte-identical to the site's), a
+`mp/kisakcod-mp.{js,wasm}` multiplayer build, and fonts/audio. Its README says "will you release the source
+code? eventually". So the GPL source request still stands.
+
+### 1c. Prior art: gymnae/cod4browser, a source-available port
+
+[gymnae/cod4browser](https://github.com/gymnae/cod4browser) (fork of `abhiyadav2345/cod4browser`, 1,078 commits
+on `web-port`, GPLv3, full upstream KisakCOD history from `1c03702c`) is a **source** port. It takes a
+different route from slqnt's:
+
+| Area | cod4browser |
+|---|---|
+| Scope | Offline **SP only**. Multiplayer transport is uncompiled. |
+| Execution | One engine Worker, **no pthreads**. **JSPI** (`WebAssembly.promising`/`Suspending`) + `emscripten_sleep(0)` keep loading synchronous-looking. Native Wasm exceptions. No COOP/COEP needed. Chromium-class browsers only. |
+| Renderer | The native D3D9 backend is **not compiled**. `src/web/web_renderer_frontend.cpp` turns canonical Kisak world/model/FX state into "portable draw commands", and a WebGL2 backend (`src/web/web_renderer*.cpp`, about 33k lines in `src/web`) draws them with **hand-written GLSL per shader family**, modeled on the retail bytecode. Its own status lists "unknown shader families", transparency, special vision, clouds/distortion/soft particles as gaps. |
+| Assets | Local import of a Steam install into OPFS/IndexedDB with an allowlisted SP profile. Reads go through sync access handles (`web/worker_sync_filesystem.mjs:882`). Hosted startup is "not supported". **No streaming.** |
+| Cinematics / audio | FFmpeg Bink decoder; canonical SND → Web Audio, with OpenAL Soft reverb/EQ in an AudioWorklet. |
+| Maturity | Large test suite (native, direct-Wasm, Node, Playwright). Killhouse/Airplane `PLAYABLE`, CargoShip/Blackout/Hunted/Bog A `FUNCTIONAL`, 14 zones untested. CargoShip measured about 17–21 FPS on an RTX 3070 Ti. |
+
+### 1d. Comparison and recommended base
+
+| | slqnt (mw.slqnt.dev) | cod4browser | Goal of this plan |
+|---|---|---|---|
+| Source available | No (binaries only) | **Yes** | — |
+| SP / MP | SP + MP build | SP | Both |
+| Renderer | General D3D9 shim + **ToGL** bytecode translation | Hand-written GLSL per shader family | Retail shaders, general |
+| Threads | pthreads + COOP/COEP | Single Worker + JSPI | — |
+| Asset delivery | Local import → OPFS | Local import → OPFS | **Streaming from a host** |
+| Networking | WebSocket relay with join codes | None | Gateway to native dedi |
+
+**Recommendation:** build on **gymnae/cod4browser**. It is the only one with source, it is your fork, and its
+storage, lifecycle and test layers are far ahead of starting fresh. Focus the work on what neither port has:
+
+1. **Asset streaming (Phase 2 below)**, implemented inside cod4browser's Worker filesystem. JSPI is already in
+   place, so a read that misses the cache can *suspend* the Wasm stack while the VFS fetches the missing
+   blocks with HTTP Range. No `SharedArrayBuffer`/`Atomics.wait` bridge and no cross-origin isolation are needed. Concretely:
+   * add an asset source next to local import in `web/asset_store.mjs`: an HTTPS origin the user controls,
+     serving their own install;
+   * use sparse OPFS files plus a 16 KiB block bitmap. The synchronous read at `worker_sync_filesystem.mjs:882`
+     serves cached blocks directly and routes misses to a JSPI-suspending fetch import;
+   * read IWD central directories first, then fetch single entries by range; prefetch fastfiles sequentially;
+   * record per-map read manifests with the existing diagnostics telemetry (`KISAK_WEB_DIAGNOSTICS`), then
+     build per-map packs and fetch them in 8 MiB × 6 during the loading screen (the mw2web numbers).
+2. **Renderer fidelity.** Evaluate adding a ToGL-based path (retail bytecode → GLSL ES) for shader families the
+   hand-written backend does not cover. slqnt's build shows ToGL handles CoD4's shaders.
+3. **Multiplayer**, later, with a WebSocket relay (slqnt's pattern) and then a gateway to native dedicated servers
+   (Phase 5).
+
+The phase list below remains the from-scratch reference. Where cod4browser has already done a phase, treat
+that phase as done and use its docs instead.
 
 ---
 
@@ -303,9 +351,9 @@ networking shim, and matches the eventual multiplayer goal. SP campaign maps reu
 
 ## 7. Immediate next steps
 
-0. Contact slqnt (https://slqnt.dev) for the GPLv3 source of the mw.slqnt.dev build (§1b). If it is
-   provided, rebase this plan onto it. Phases 0, 1, 3 and 4 are largely done there, and Phase 2
-   (host streaming) plus Phase 5 (MP against native servers) become the contribution.
+0. Work in [gymnae/cod4browser](https://github.com/gymnae/cod4browser) (§1c–1d). Build it, run its
+   test tiers, and start the streaming VFS there. Separately, ask slqnt (https://slqnt.dev) for the GPLv3
+   source of the mw.slqnt.dev SP/MP builds (§1b); their ToGL renderer path and MP relay are worth merging.
 1. Land the Phase 0 portability layer behind `KISAK_PLATFORM=linux`, and get dedi building with clang `-m32`.
 2. Write `tools/shaderdump`: extract every vertex/pixel shader from a fastfile and run it through ToGL → GLSL ES →
    `glslangValidator`, to measure translation coverage early (the biggest technical unknown).
